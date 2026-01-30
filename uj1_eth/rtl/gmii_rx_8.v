@@ -14,7 +14,7 @@
  */
 
 /* TODO:
- * 1. add FCS 
+ * 1. add FCS - finished
  * 2. add PTP
  * 3. testbench
  */
@@ -79,6 +79,28 @@ reg                 m_axis_tuser_q = 1'b0,              m_axis_tuser_next;
 reg                 er_bad_frame_q = 1'b0,              er_bad_frame_next;
 reg                 er_bad_fcs_q   = 1'b0,              er_bad_fcs_next;
 
+reg                 reset_crc;
+reg                 update_crc;
+
+reg [31:0]          crc_state = 32'hFFFFFFFF;
+wire [31:0]         crc_next;
+
+lfsr #(
+    .LFSR_WIDTH(32),
+    .LFSR_POLY(32'h4c11db7),
+    .LFSR_CONFIG("GALOIS"),
+    .LFSR_FEED_FORWARD(0),
+    .REVERSE(1),
+    .DATA_WIDTH(8),
+    .STYLE("AUTO")
+)
+eth_crc_8 (
+    .data_in(gmii_rxd_d4),
+    .state_in(crc_state),
+    .data_out(),
+    .state_out(crc_next)
+);
+
 assign              m_axis_tdata    = m_axis_tdata_q;
 assign              m_axis_tvalid   = m_axis_tvalid_q;
 assign              m_axis_tlast    = m_axis_tlast_q;
@@ -100,12 +122,18 @@ always @(*) begin
     er_bad_frame_next   = 1'b0;
     er_bad_fcs_next     = 1'b0;
     
-    if (s_idle_q && gmii_rx_dv_d4 && !gmii_rx_er_d4 && (gmii_rxd == ETH_SFD)) begin
-        s_idle_next     = 1'b0;
-        s_payload_next  = 1'b1;
+    if (s_idle_q) begin
+        reset_crc = 1'b1;
+        s_idle_next     = 1'b1;
+        s_payload_next  = 1'b0;
+        if (gmii_rx_dv_d4 && !gmii_rx_er_d4 && (gmii_rxd == ETH_SFD)) begin
+            s_idle_next = 1'b0;
+            s_payload_next = 1'b1;
+        end
     end
     
     if (s_payload_q) begin
+        update_crc = 1'b1;
         s_payload_next = 1'b1;
         m_axis_tdata_next = gmii_rxd_d4;
         m_axis_tvalid_next = 1'b1;
@@ -114,7 +142,17 @@ always @(*) begin
             s_idle_next = 1'b1;
             s_payload_next = 1'b0;
             m_axis_tlast_next = 1'b1;
-            // TODO: FCS
+            if (gmii_rx_er_d0 || gmii_rx_er_d1 || gmii_rx_er_d2 || gmii_rx_er_d3) begin
+                m_axis_tuser_next = 1'b1;
+                error_bad_frame_next = 1'b1;
+            end else if ({gmii_rxd_d0, gmii_rxd_d1, gmii_rxd_d2, gmii_rxd_d3} == ~crc_next) begin
+                m_axis_tuser_next = 1'b0;
+            end else begin
+                m_axis_tuser_next = 1'b1;
+                error_bad_frame_next = 1'b1;
+                error_bad_fcs_next = 1'b1;
+            end
+                s_idle_next = 1'b1;
         end
         // error in packet
         if (gmii_rx_dv && gmii_rx_er) begin
@@ -165,6 +203,12 @@ always @(posedge clk) begin
     m_axis_tvalid_q <= m_axis_tvalid_next;
     m_axis_tlast_q  <= m_axis_tlast_next;
     m_axis_tuser_q  <= m_axis_tuser_next;
+
+    if (reset_crc) begin
+        crc_state <= 32'hFFFFFFFF;
+    end else if (update_crc) begin
+        crc_state <= crc_next;
+    end
     
     if (!rst_n) begin
         s_idle_q     <= 1'b1;
